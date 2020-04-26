@@ -29,7 +29,7 @@ create(Host, Port) ->
             lists:map(
               fun(I) ->
                       WorkerName = worker_name(PoolName, I),
-                      {ok, _} = supervisor:start_link(
+                      {ok, _} = supervisor:start_child(
                                   ?MODULE,
                                   #{id => WorkerName,
                                     start => {?MODULE, start_link_eredis, [WorkerName, EredisArgs]}})
