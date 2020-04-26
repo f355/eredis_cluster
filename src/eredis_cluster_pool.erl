@@ -2,6 +2,7 @@
 -behaviour(supervisor).
 
 %% API.
+-export([start_link_eredis/2]).
 -export([create/2]).
 -export([stop/1]).
 -export([transaction/2]).
@@ -13,61 +14,74 @@
 -include("eredis_cluster.hrl").
 
 -spec create(Host::string(), Port::integer()) ->
-    {ok, PoolName::atom()} | {error, PoolName::atom()}.
+          {ok, PoolName::atom()} | {error, PoolName::atom()}.
 create(Host, Port) ->
-	PoolName = get_name(Host, Port),
+    PoolName = pool_name(Host, Port),
 
-    case whereis(PoolName) of
+    case whereis(worker_name(PoolName, 1)) of
         undefined ->
-            DataBase = application:get_env(eredis_cluster, database, 0),
-            Password = application:get_env(eredis_cluster, password, ""),
-            WorkerArgs = [{host, Host},
-                          {port, Port},
-                          {database, DataBase},
-                          {password, Password}
-                         ],
+            EredisArgs =
+                [Host,
+                 Port,
+                 application:get_env(eredis_cluster, database, 0),
+                 application:get_env(eredis_cluster, password, "")],
 
-        	Size = application:get_env(eredis_cluster, pool_size, 10),
-        	MaxOverflow = application:get_env(eredis_cluster, pool_max_overflow, 0),
-
-            PoolArgs = [{name, {local, PoolName}},
-                        {worker_module, eredis_cluster_pool_worker},
-                        {size, Size},
-                        {max_overflow, MaxOverflow}],
-
-            ChildSpec = poolboy:child_spec(PoolName, PoolArgs, WorkerArgs),
-
-            {Result, _} = supervisor:start_child(?MODULE,ChildSpec),
-        	{Result, PoolName};
+            lists:map(
+              fun(I) ->
+                      WorkerName = worker_name(PoolName, I),
+                      {ok, _} = supervisor:start_link(
+                                  ?MODULE,
+                                  #{id => WorkerName,
+                                    start => {?MODULE, start_link_eredis, [WorkerName, EredisArgs]}})
+              end, lists:seq(1, pool_size())),
+            {ok, PoolName};
         _ ->
             {ok, PoolName}
     end.
 
--spec transaction(PoolName::atom(), fun((Worker::pid()) -> redis_result())) ->
-    redis_result().
 transaction(PoolName, Transaction) ->
-    try
-        poolboy:transaction(PoolName, Transaction)
-    catch
-        exit:_ ->
-            {error, no_connection}
-    end.
+    Transaction(random_worker(PoolName)).
 
 -spec stop(PoolName::atom()) -> ok.
 stop(PoolName) ->
-    supervisor:terminate_child(?MODULE,PoolName),
-    supervisor:delete_child(?MODULE,PoolName),
+    lists:foreach(
+      fun(I) ->
+              W = worker_name(PoolName, I),
+              supervisor:terminate_child(?MODULE, W),
+              supervisor:delete_child(?MODULE, W)
+      end, lists:seq(1, pool_size())),
     ok.
 
--spec get_name(Host::string(), Port::integer()) -> PoolName::atom().
-get_name(Host, Port) ->
-    list_to_atom(Host ++ "#" ++ integer_to_list(Port)).
+start_link_eredis(Name, Args) ->
+    {ok, Pid} = apply(eredis, start_link, Args),
+    erlang:register(Name, Pid),
+    {ok, Pid}.
+
+random_worker(PoolName) ->
+    worker_name(PoolName, rand:uniform(pool_size())).
+
+pool_name(Host, Port) ->
+    binary_to_atom(
+      iolist_to_binary(
+        [<<"eredis_cluster_worker_">>,
+         Host, "_",
+         integer_to_binary(Port)]), utf8).
+
+-spec worker_name(PoolName::atom(), N::integer()) -> PoolName::atom().
+worker_name(PoolName, N) ->
+    binary_to_atom(
+      iolist_to_binary(
+        [atom_to_binary(PoolName, utf8), "_",
+         integer_to_binary(N)]), utf8).
+
+pool_size() ->
+    application:get_env(eredis_cluster, pool_size, 10).
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
-	supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 -spec init([])
-	-> {ok, {{supervisor:strategy(), 1, 5}, [supervisor:child_spec()]}}.
+          -> {ok, {{supervisor:strategy(), 1, 5}, [supervisor:child_spec()]}}.
 init([]) ->
-	{ok, {{one_for_one, 1, 5}, []}}.
+    {ok, {{one_for_one, 1, 5}, []}}.
